@@ -51,6 +51,7 @@ pub fn with_sdpa_implementation<T>(implementation: SDPAImplementation, f: impl F
 pub struct SDPAConfig {
     dropout: Box<dyn BuildModule>,
     linear_biases: Option<AttentionLinearBiasesConfig>,
+    causal_mask_sliding_window: Option<usize>,
 }
 
 impl SDPAConfig {
@@ -69,6 +70,14 @@ impl SDPAConfig {
         self.linear_biases = linear_biases;
         self
     }
+
+    /// Sliding window size for causal mask.
+    ///
+    /// Default: `None`.
+    pub fn causal_mask_sliding_window(mut self, sliding_window: Option<usize>) -> Self {
+        self.causal_mask_sliding_window = sliding_window;
+        self
+    }
 }
 
 impl Default for SDPAConfig {
@@ -76,6 +85,7 @@ impl Default for SDPAConfig {
         Self {
             dropout: Box::new(Identity),
             linear_biases: None,
+            causal_mask_sliding_window: None,
         }
     }
 }
@@ -90,6 +100,7 @@ impl BuildAttentionScorer for SDPAConfig {
                 .map(|linear_biases| linear_biases.build())
                 .transpose()
                 .context(BuildAttentionLinearBiasesSnafu)?,
+            causal_mask_sliding_window: self.causal_mask_sliding_window.clone(),
         }))
     }
 }
@@ -141,6 +152,9 @@ pub enum SDPAError {
 
     #[snafu(display("Cannot unpad heads"))]
     UnpadHeads { source: candle_core::Error },
+
+    #[snafu(display("Cannot apply sliding window when using flash attention"))]
+    SlidingWindowFlashAttention,
 }
 
 /// Scaled dot-product attention.
@@ -149,6 +163,7 @@ pub enum SDPAError {
 pub struct SDPA {
     dropout: Box<dyn ModuleT>,
     linear_biases: Option<AttentionLinearBiases>,
+    causal_mask_sliding_window: Option<usize>,
 }
 
 impl AttentionScorer for SDPA {
@@ -214,8 +229,12 @@ impl SDPA {
 
         let mut combined_mask: SelfAttentionMask = attention_mask.into();
         if use_causal_mask {
-            let causal_mask =
-                SelfAttentionMask::causal_mask(&query, key).context(CausalMaskSnafu)?;
+            let causal_mask = SelfAttentionMask::causal_mask(
+                &query,
+                key,
+                self.causal_mask_sliding_window.clone(),
+            )
+            .context(CausalMaskSnafu)?;
             combined_mask = combined_mask
                 .intersect(&causal_mask)
                 .context(SelfAttentionMaskSnafu)?;
@@ -247,6 +266,13 @@ impl SDPA {
         use_causal_mask: bool,
     ) -> Result<Tensor, SDPAError> {
         use candle_flash_attn::{flash_attn_varlen, flash_attn_varlen_alibi};
+        use snafu::ensure;
+
+        // TODO: add support for sliding window.
+        ensure!(
+            self.causal_mask_sliding_window.is_none(),
+            SlidingWindowFlashAttention
+        );
 
         let (_batch_size, _kv_heads, key_value_len, head_width) =
             key.dims4().context(FlashAttentionSnafu)?;

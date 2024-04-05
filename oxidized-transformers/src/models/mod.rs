@@ -12,6 +12,9 @@ pub mod hf;
 mod llama;
 pub use llama::{LlamaCausalLM, LlamaDecoder};
 
+mod mistral;
+pub use mistral::MistralDecoder;
+
 mod roberta;
 pub use roberta::{RobertaEmbeddings, RobertaEmbeddingsConfig, RobertaEncoder};
 

@@ -596,13 +596,22 @@ pub trait CausalMask: Sized {
     ///   *Shape:* `(batch_size, heads, query_len, width)`
     /// * `key` - Key tensor.
     ///   *Shape:* `(batch_size, heads, key_len, width)`
-    fn causal_mask(query: &Tensor, key: &Tensor) -> Result<Self, Self::Error>;
+    /// * `sliding_window` - Sliding window size.
+    fn causal_mask(
+        query: &Tensor,
+        key: &Tensor,
+        sliding_widow: Option<usize>,
+    ) -> Result<Self, Self::Error>;
 }
 
 impl CausalMask for SelfAttentionMask {
     type Error = CausalMaskError;
 
-    fn causal_mask(query: &Tensor, key: &Tensor) -> Result<Self, Self::Error> {
+    fn causal_mask(
+        query: &Tensor,
+        key: &Tensor,
+        sliding_widow: Option<usize>,
+    ) -> Result<Self, Self::Error> {
         let (_, _, query_len, _) = query.shape().dims4().context(QueryDimSnafu)?;
         let (_, _, key_len, _) = key.shape().dims4().context(KeyDimSnafu)?;
 
@@ -610,9 +619,22 @@ impl CausalMask for SelfAttentionMask {
         // the key length.
         ensure!(query_len <= key_len, QueryLenSnafu { key_len, query_len });
 
-        let causal_mask = Tensor::tril2(key_len, DType::U8, key.device())
-            .and_then(|mask| mask.reshape((1, 1, key_len, key_len)))
-            .context(CreateMaskSnafu)?;
+        let causal_mask = match sliding_widow {
+            Some(window) => {
+                // We need to manually create the lower-triangular matrix as
+                // candle doesn't support custom diagonals.
+                let mask = (0..key_len)
+                    .flat_map(|i| {
+                        (0..key_len).map(move |j| if j >= i || j < i - window { 0u8 } else { 1u8 })
+                    })
+                    .collect::<Vec<u8>>();
+                Tensor::from_slice(&mask, (key_len, key_len), key.device())
+            }
+            None => Tensor::tril2(key_len, DType::U8, key.device()),
+        }
+        .and_then(|mask| mask.reshape((1, 1, key_len, key_len)))
+        .context(CreateMaskSnafu)?;
+
         Ok(Self {
             bool_mask: causal_mask
                 .i((.., .., key_len - query_len..key_len, ..key_len))
